@@ -28,18 +28,17 @@ async function getLiveKitReceiver() {
 
 // ---- Route Handlers -------------------------------------------------------
 
-// Achtung: In Next 15 können params als Promise typisiert sein → awaiten!
 export async function POST(
   req: NextRequest,
   context: { params: Promise<{ projectSlug: string }> }
 ) {
   const { projectSlug } = await context.params;
 
-  // 1) Raw body (für Signaturprüfung)
+  // 1️⃣ Roh-Body lesen (für Signaturprüfung)
   const rawBody = await req.text();
   const authHeader = req.headers.get('authorization') || '';
 
-  // 2) LiveKit Webhook verifizieren
+  // 2️⃣ Webhook-Event verifizieren
   let event: any;
   try {
     const receiver = await getLiveKitReceiver();
@@ -49,7 +48,7 @@ export async function POST(
     return new NextResponse('invalid signature', { status: 401 });
   }
 
-  // 3) Projektzuordnung aus Supabase holen
+  // 3️⃣ Supabase initialisieren & Projekt abrufen
   let sb;
   try {
     sb = getSupabaseAdmin();
@@ -69,22 +68,80 @@ export async function POST(
     return NextResponse.json({ ok: true }, { status: 204 });
   }
 
-  // 4) Vorerst alles in agent_logs protokollieren
-  const { error: insErr } = await sb.from('agent_logs').insert({
-    org_id: lkproj.org_id,
-    level: 'debug',
-    event: event.event ?? 'unknown_event',
-    meta: event,
-  });
-  if (insErr) {
-    console.error('DB insert failed:', insErr.message);
+  // 4️⃣ Ereignis verarbeiten und protokollieren
+  try {
+    // immer loggen
+    const { error: logErr } = await sb.from('agent_logs').insert({
+      org_id: lkproj.org_id,
+      level: 'debug',
+      event: event.event ?? 'unknown_event',
+      meta: event,
+    });
+    if (logErr) console.error('agent_logs insert failed:', logErr.message);
+
+    // Room-Infos extrahieren (LiveKit liefert unterschiedliche Strukturen)
+    const room =
+      (event && (event.room || event.data?.room || event.payload?.room)) ?? {};
+    const roomSid: string | undefined =
+      room.sid || room.room_sid || event.room_sid;
+    const roomName: string | undefined = room.name || event.room?.name;
+    const createdAtMs: number | undefined =
+      (typeof event.created_at === 'number' ? event.created_at : undefined) ||
+      (typeof event.timestamp === 'number' ? event.timestamp : undefined);
+    const nowIso = new Date().toISOString();
+    const startedIso = createdAtMs
+      ? new Date(createdAtMs).toISOString()
+      : nowIso;
+
+    switch (event.event) {
+      case 'room_started': {
+        // neuen Call anlegen (falls nicht vorhanden)
+        const { error } = await sb.from('calls').upsert(
+          {
+            org_id: lkproj.org_id,
+            external_ref: roomSid ?? roomName ?? `room-${nowIso}`,
+            started_at: startedIso,
+            summary: null,
+            tags: [],
+          },
+          { onConflict: 'external_ref' }
+        );
+        if (error)
+          console.error('calls upsert (room_started) failed:', error.message);
+        break;
+      }
+
+      case 'room_finished': {
+        // Call beenden
+        if (!roomSid && !roomName) {
+          console.warn('room_finished without roomSid/roomName');
+          break;
+        }
+        const ref = roomSid ?? roomName!;
+        const { error } = await sb
+          .from('calls')
+          .update({ ended_at: startedIso })
+          .eq('external_ref', ref)
+          .eq('org_id', lkproj.org_id);
+        if (error)
+          console.error('calls update (room_finished) failed:', error.message);
+        break;
+      }
+
+      default:
+        // alle anderen Events nur loggen
+        break;
+    }
+  } catch (dbErr: any) {
+    console.error('Unexpected DB error:', dbErr?.message);
     return new NextResponse('db error', { status: 500 });
   }
 
   return NextResponse.json({ ok: true });
 }
 
+// ---- Healthcheck ----------------------------------------------------------
+
 export async function GET() {
-  // einfacher Healthcheck
   return NextResponse.json({ ok: true });
 }
