@@ -5,7 +5,8 @@ export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
-// ⚙️ Hilfsfunktionen für Supabase + LiveKit
+// ---- Helpers --------------------------------------------------------------
+
 function getSupabaseAdmin() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -15,26 +16,30 @@ function getSupabaseAdmin() {
   return createClient(url, serviceKey, { auth: { persistSession: false } });
 }
 
-// 🔑 Dynamischer Import: LiveKit SDK nur bei Bedarf laden
+// LiveKit SDK dynamisch laden, damit der Bundler es nicht zur Build-Zeit auflöst
 async function getLiveKitReceiver() {
   const key = process.env.LIVEKIT_API_KEY;
   const secret = process.env.LIVEKIT_API_SECRET;
-  if (!key || !secret) {
-    throw new Error('Missing LiveKit API credentials');
-  }
+  if (!key || !secret) throw new Error('Missing LiveKit API credentials');
+
   const { WebhookReceiver } = await import('livekit-server-sdk');
   return new WebhookReceiver(key, secret);
 }
 
-// 📨 Haupt-Webhook-Handler
-export async function POST(req: NextRequest, context: { params: { projectSlug: string } }) {
-  const { projectSlug } = context.params;
+// ---- Route Handlers -------------------------------------------------------
 
-  // 1️⃣ Roh-Body lesen (nicht json())
+// Achtung: In Next 15 können params als Promise typisiert sein → awaiten!
+export async function POST(
+  req: NextRequest,
+  context: { params: Promise<{ projectSlug: string }> }
+) {
+  const { projectSlug } = await context.params;
+
+  // 1) Raw body (für Signaturprüfung)
   const rawBody = await req.text();
   const authHeader = req.headers.get('authorization') || '';
 
-  // 2️⃣ Webhook verifizieren
+  // 2) LiveKit Webhook verifizieren
   let event: any;
   try {
     const receiver = await getLiveKitReceiver();
@@ -44,7 +49,7 @@ export async function POST(req: NextRequest, context: { params: { projectSlug: s
     return new NextResponse('invalid signature', { status: 401 });
   }
 
-  // 3️⃣ Projektzuordnung prüfen
+  // 3) Projektzuordnung aus Supabase holen
   let sb;
   try {
     sb = getSupabaseAdmin();
@@ -64,27 +69,22 @@ export async function POST(req: NextRequest, context: { params: { projectSlug: s
     return NextResponse.json({ ok: true }, { status: 204 });
   }
 
-  // 4️⃣ Ereignis protokollieren
-  try {
-    const { error: insErr } = await sb.from('agent_logs').insert({
-      org_id: lkproj.org_id,
-      level: 'debug',
-      event: event.event ?? 'unknown_event',
-      meta: event,
-    });
-    if (insErr) {
-      console.error('DB insert failed:', insErr.message);
-      return new NextResponse('db error', { status: 500 });
-    }
-  } catch (dbErr: any) {
-    console.error('Unexpected DB error:', dbErr?.message);
+  // 4) Vorerst alles in agent_logs protokollieren
+  const { error: insErr } = await sb.from('agent_logs').insert({
+    org_id: lkproj.org_id,
+    level: 'debug',
+    event: event.event ?? 'unknown_event',
+    meta: event,
+  });
+  if (insErr) {
+    console.error('DB insert failed:', insErr.message);
     return new NextResponse('db error', { status: 500 });
   }
 
   return NextResponse.json({ ok: true });
 }
 
-// 🌐 Health-Check-Route
 export async function GET() {
+  // einfacher Healthcheck
   return NextResponse.json({ ok: true });
 }
