@@ -5,8 +5,6 @@ export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
-// ---- Helpers --------------------------------------------------------------
-
 function getSupabaseAdmin() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -16,17 +14,14 @@ function getSupabaseAdmin() {
   return createClient(url, serviceKey, { auth: { persistSession: false } });
 }
 
-// LiveKit SDK dynamisch laden, damit der Bundler es nicht zur Build-Zeit auflöst
+// LiveKit SDK dynamisch laden (Build-Probleme vermeiden)
 async function getLiveKitReceiver() {
   const key = process.env.LIVEKIT_API_KEY;
   const secret = process.env.LIVEKIT_API_SECRET;
   if (!key || !secret) throw new Error('Missing LiveKit API credentials');
-
   const { WebhookReceiver } = await import('livekit-server-sdk');
   return new WebhookReceiver(key, secret);
 }
-
-// ---- Route Handlers -------------------------------------------------------
 
 export async function POST(
   req: NextRequest,
@@ -34,11 +29,10 @@ export async function POST(
 ) {
   const { projectSlug } = await context.params;
 
-  // 1️⃣ Roh-Body lesen (für Signaturprüfung)
   const rawBody = await req.text();
   const authHeader = req.headers.get('authorization') || '';
 
-  // 2️⃣ Webhook-Event verifizieren
+  // 1) verifizieren
   let event: any;
   try {
     const receiver = await getLiveKitReceiver();
@@ -48,15 +42,8 @@ export async function POST(
     return new NextResponse('invalid signature', { status: 401 });
   }
 
-  // 3️⃣ Supabase initialisieren & Projekt abrufen
-  let sb;
-  try {
-    sb = getSupabaseAdmin();
-  } catch (e: any) {
-    console.error('Server env misconfig:', e?.message);
-    return new NextResponse('server env misconfig', { status: 500 });
-  }
-
+  // 2) passendes LiveKit-Projekt holen
+  const sb = getSupabaseAdmin();
   const { data: lkproj, error: lkErr } = await sb
     .from('livekit_projects')
     .select('id, org_id, slug, is_active')
@@ -68,7 +55,7 @@ export async function POST(
     return NextResponse.json({ ok: true }, { status: 204 });
   }
 
-  // 4️⃣ Ereignis verarbeiten und protokollieren
+  // 3) loggen + calls mappen
   try {
     // immer loggen
     const { error: logErr } = await sb.from('agent_logs').insert({
@@ -79,40 +66,32 @@ export async function POST(
     });
     if (logErr) console.error('agent_logs insert failed:', logErr.message);
 
-    // Room-Infos extrahieren (LiveKit liefert unterschiedliche Strukturen)
-    const room =
-      (event && (event.room || event.data?.room || event.payload?.room)) ?? {};
-    const roomSid: string | undefined =
-      room.sid || room.room_sid || event.room_sid;
+    // room infos
+    const room = (event && (event.room || event.data?.room || event.payload?.room)) ?? {};
+    const roomSid: string | undefined = room.sid || room.room_sid || event.room_sid;
     const roomName: string | undefined = room.name || event.room?.name;
     const createdAtMs: number | undefined =
       (typeof event.created_at === 'number' ? event.created_at : undefined) ||
       (typeof event.timestamp === 'number' ? event.timestamp : undefined);
     const nowIso = new Date().toISOString();
-    const startedIso = createdAtMs
-      ? new Date(createdAtMs).toISOString()
-      : nowIso;
+    const tsIso = createdAtMs ? new Date(createdAtMs).toISOString() : nowIso;
 
     switch (event.event) {
       case 'room_started': {
-        // neuen Call anlegen (falls nicht vorhanden)
         const { error } = await sb.from('calls').upsert(
           {
             org_id: lkproj.org_id,
             external_ref: roomSid ?? roomName ?? `room-${nowIso}`,
-            started_at: startedIso,
+            started_at: tsIso,
             summary: null,
             tags: [],
           },
           { onConflict: 'external_ref' }
         );
-        if (error)
-          console.error('calls upsert (room_started) failed:', error.message);
+        if (error) console.error('calls upsert (room_started) failed:', error.message);
         break;
       }
-
       case 'room_finished': {
-        // Call beenden
         if (!roomSid && !roomName) {
           console.warn('room_finished without roomSid/roomName');
           break;
@@ -120,16 +99,14 @@ export async function POST(
         const ref = roomSid ?? roomName!;
         const { error } = await sb
           .from('calls')
-          .update({ ended_at: startedIso })
+          .update({ ended_at: tsIso })
           .eq('external_ref', ref)
           .eq('org_id', lkproj.org_id);
-        if (error)
-          console.error('calls update (room_finished) failed:', error.message);
+        if (error) console.error('calls update (room_finished) failed:', error.message);
         break;
       }
-
       default:
-        // alle anderen Events nur loggen
+        // andere Events nur geloggt
         break;
     }
   } catch (dbErr: any) {
@@ -139,8 +116,6 @@ export async function POST(
 
   return NextResponse.json({ ok: true });
 }
-
-// ---- Healthcheck ----------------------------------------------------------
 
 export async function GET() {
   return NextResponse.json({ ok: true });
